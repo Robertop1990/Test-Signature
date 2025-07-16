@@ -1,0 +1,430 @@
+using Serilog;
+using WU.PointOfSale.Console.Services; // Tus espacios de nombres
+
+var configuration = new ConfigurationBuilder()
+    .AddJsonFile("appsettings.json")
+    .Build();
+
+Log.Logger = new LoggerConfiguration()
+    .ReadFrom.Configuration(configuration)
+    .Enrich.FromLogContext()
+    .CreateLogger();
+
+try
+{
+    Log.Information("PointOfSale.Console service has started.");
+
+    Host.CreateDefaultBuilder(args)
+        .UseWindowsService()
+        .UseSerilog() // Esto es suficiente, no pongas `UseSerilog(Log.Logger)`
+        .ConfigureServices((hostContext, services) =>
+        {
+            services.AddSingleton<IWacomService, WacomService>();
+            services.AddSingleton<ISecurityService, SecurityService>();
+            services.AddSingleton<IPrinterService, PrinterService>();
+            services.AddSingleton<SignatureController>();
+            services.AddSingleton<SecurityController>();
+            services.AddSingleton<PrinterController>();
+            services.AddHostedService<WebApiHostedService>();
+        })
+        .Build()
+        .Run();
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "An unexpected error occurred. The application is shutting down.");
+}
+finally
+{
+    Log.CloseAndFlush();
+}
+
+
+///////
+
+
+public Response<PrinterResponseDTO> PrintTicket(FileDTO fileDTO)
+{
+    var method = nameof(PrintTicket);
+    _logger.LogInformation("Starting {Method} process for file: {FileName}", method, fileDTO.Name);
+
+    var validations = ValidateFileToPrint(fileDTO);
+
+    if (!string.IsNullOrEmpty(validations))
+    {
+        _logger.LogWarning("Validation failed in {Method}: {ValidationMessage}", method, validations);
+        return new Response<PrinterResponseDTO>(new Exception(validations));
+    }
+
+    try
+    {
+        byte[] imageBytes = Convert.FromBase64String(fileDTO.Content);
+        using var ms = new MemoryStream(imageBytes);
+        using var img = Image.FromStream(ms);
+
+        _logger.LogInformation("{Method}: Image loaded successfully from base64", method);
+
+        var printerName = _configuration["PrinterConfiguration:PrinterName"];
+
+        if (!PrinterSettings.InstalledPrinters.Cast<string>().Any(p => p.Equals(printerName, StringComparison.OrdinalIgnoreCase)))
+        {
+            _logger.LogWarning("{Method}: Printer '{PrinterName}' not found on the system", method, printerName);
+            return new Response<PrinterResponseDTO>(new Exception(resourceManager.GetString("print_msg_PrinterNotFound")));
+        }
+
+        PrintDocument documentToPrint = new PrintDocument
+        {
+            PrinterSettings = new PrinterSettings
+            {
+                PrinterName = printerName,
+                Copies = 1
+            },
+            DefaultPageSettings = new PageSettings
+            {
+                Margins = new Margins(0, 0, 0, 0),
+                PaperSize = new PaperSize("Custom", img.Width, img.Height)
+            },
+            OriginAtMargins = false,
+            PrintController = new StandardPrintController()
+        };
+
+        int offsetX = -10;
+
+        documentToPrint.PrintPage += (thesender, ev) =>
+        {
+            ev.Graphics.DrawImage(Image.FromStream(new MemoryStream(Convert.FromBase64String(fileDTO.Content))),
+                new PointF(ev.MarginBounds.Left + offsetX, ev.MarginBounds.Top));
+        };
+
+        _logger.LogInformation("{Method}: Sending document to printer: {PrinterName}", method, printerName);
+        documentToPrint.Print();
+
+        _logger.LogInformation("{Method} process completed successfully for file: {FileName}", method, fileDTO.Name);
+        return new Response<PrinterResponseDTO>(null, resourceManager.GetString("print_msg_Successfully") + fileDTO.Name);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "An error occurred in {Method}", method);
+        return new Response<PrinterResponseDTO>(new Exception(resourceManager.GetString("global_msg_InternalError")));
+    }
+}
+
+
+// 
+
+public Response<WorkStationInformationResponseDTO> GetComputerInformation()
+{
+    var method = nameof(GetComputerInformation);
+    _logger.LogInformation("Starting {Method} process.", method);
+
+    try
+    {
+        WorkStationInformationResponseDTO response = new WorkStationInformationResponseDTO();
+
+        string hostName = Dns.GetHostName();
+        response.HostName = hostName;
+        _logger.LogInformation("{Method} - HostName: {HostName}", method, hostName);
+
+        IPAddress[] ipAddresses = Dns.GetHostAddresses(hostName);
+
+        foreach (IPAddress ip4 in ipAddresses.Where(ip => ip.AddressFamily == AddressFamily.InterNetwork))
+        {
+            response.IPAddress_v4 = ip4.ToString();
+            _logger.LogInformation("{Method} - IPv4 Address: {IPAddress}", method, response.IPAddress_v4);
+        }
+
+        foreach (IPAddress ip6 in ipAddresses.Where(ip => ip.AddressFamily == AddressFamily.InterNetworkV6))
+        {
+            response.IPAddress_v6 = ip6.ToString();
+            _logger.LogInformation("{Method} - IPv6 Address: {IPAddress}", method, response.IPAddress_v6);
+        }
+
+        response.MACAddress = GetMACAddress();
+        _logger.LogInformation("{Method} - MAC Address: {MAC}", method, response.MACAddress);
+
+        response.Domain = IPGlobalProperties.GetIPGlobalProperties().DomainName;
+        _logger.LogInformation("{Method} - Domain: {Domain}", method, response.Domain);
+
+        _logger.LogInformation("{Method} process completed successfully.", method);
+        return new Response<WorkStationInformationResponseDTO>(response);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "{Method} - An unexpected error occurred.", method);
+        return new Response<WorkStationInformationResponseDTO>(null, resourceManager.GetString("global_msg_InternalError"));
+    }
+}
+
+
+//
+private void EventsScreen(TransferInformationRequestDTO transferInformation = null)
+{
+    _logger.LogDebug("Starting {Method} process", nameof(EventsScreen));
+
+    _tablet.setInkingMode(1);
+    _tablet.setPenDataOptionMode((byte)penDataOptionMode.PenDataOptionMode_None);
+
+    penDataList.Clear();
+    signatureCanceled = false;
+    signatureCompleted = false;
+
+    bool canClear = true;
+    bool penIsDown = false;
+    bool isFirstStrokePoint = true;
+
+    async void penDataHandler(IPenData pPenData)
+    {
+        if (signatureCompleted || signatureCanceled) return;
+
+        var cap = _tablet.getCapability();
+
+        int screenX = pPenData.x * cap.screenWidth / cap.tabletMaxX;
+        int screenY = pPenData.y * cap.screenHeight / cap.tabletMaxY;
+
+        if (pPenData.sw == 0)
+        {
+            if (penIsDown)
+                penDataList.Add(Point.Empty);
+
+            penIsDown = false;
+            isFirstStrokePoint = true;
+            return;
+        }
+
+        if (!penIsDown)
+        {
+            if (btnAcceptArea.Contains(screenX, screenY))
+            {
+                _logger.LogInformation("{Method}: Signature accepted by user", nameof(EventsScreen));
+                signatureCompleted = true;
+                penIsDown = true;
+                return;
+            }
+
+            if (btnCancelArea.Contains(screenX, screenY))
+            {
+                _logger.LogInformation("{Method}: Signature canceled by user", nameof(EventsScreen));
+                signatureCanceled = true;
+                penIsDown = true;
+                return;
+            }
+
+            if (btnClearArea.Contains(screenX, screenY))
+            {
+                if (canClear)
+                {
+                    _logger.LogInformation("{Method}: Signature clear requested by user", nameof(EventsScreen));
+                    canClear = false;
+                    penIsDown = true;
+
+                    _tablet.onPenData -= penDataHandler;
+
+                    penDataList.Clear();
+                    DrawScreen(cap.screenWidth, cap.screenHeight, transferInformation);
+                    await Task.Delay(50);
+                    _tablet.setInkingMode(1);
+                    await Task.Delay(50);
+
+                    canClear = true;
+                    isFirstStrokePoint = true;
+
+                    _tablet.onPenData += penDataHandler;
+                }
+
+                return;
+            }
+
+            penIsDown = true;
+        }
+
+        if (isFirstStrokePoint)
+        {
+            _logger.LogDebug("{Method}: Starting stroke input", nameof(EventsScreen));
+            penDataList.Add(Point.Empty);
+            isFirstStrokePoint = false;
+        }
+
+        penDataList.Add(new Point(screenX, screenY));
+    }
+
+    _tablet.onPenData -= penDataHandler;
+    _tablet.onPenData += penDataHandler;
+
+    while (!signatureCompleted && !signatureCanceled)
+    {
+        Thread.Sleep(100);
+    }
+
+    _tablet.setInkingMode(0);
+    _tablet.onPenData -= penDataHandler;
+    _tablet.disconnect();
+
+    _logger.LogDebug("Completed {Method} process", nameof(EventsScreen));
+}
+
+
+/////
+
+
+{
+    const string method = nameof(DrawScreen);
+    _logger.LogDebug("Starting {Method} process", method);
+
+    using var ui = new Bitmap(screenWidth, screenHeight);
+    using (var g = Graphics.FromImage(ui))
+    {
+        g.Clear(Color.White);
+
+        if (transferInformation != null)
+        {
+            _logger.LogDebug("{Method}: Drawing screen with transfer information: {Info}", method, JsonSerializer.Serialize(transferInformation));
+            DrawScreemTransferInformation(transferInformation, g, screenWidth, screenHeight);
+        }
+
+        // Botón Cancelar
+        btnCancelArea = new Rectangle(10, screenHeight - 60, 180, 50);
+        var gradCancel = new LinearGradientBrush(
+            btnCancelArea, Color.FromArgb(0xFF, 0x5C, 0x5C), Color.FromArgb(0xCC, 0x00, 0x00), 90f);
+        g.FillPath(gradCancel, RoundedRectangle(btnCancelArea, 10));
+        g.DrawString(resourceManager.GetString("signature_btn_Cancel"), new Font("Arial", 14, FontStyle.Bold), Brushes.White,
+            CenterText(btnCancelArea, resourceManager.GetString("signature_btn_Cancel"), g, new Font("Arial", 14, FontStyle.Bold)));
+
+        // Botón Limpiar
+        btnClearArea = new Rectangle((screenWidth / 2) - 90, screenHeight - 60, 180, 50);
+        var gradClear = new LinearGradientBrush(
+            btnClearArea, Color.FromArgb(0xFF, 0xE0, 0x66), Color.FromArgb(0xFF, 0xCC, 0x00), 90f);
+        g.FillPath(gradClear, RoundedRectangle(btnClearArea, 10));
+        g.DrawString(resourceManager.GetString("signature_btn_Clean"), new Font("Arial", 14, FontStyle.Bold), Brushes.White,
+            CenterText(btnClearArea, resourceManager.GetString("signature_btn_Clean"), g, new Font("Arial", 14, FontStyle.Bold)));
+
+        // Botón Aceptar
+        btnAcceptArea = new Rectangle(screenWidth - 190, screenHeight - 60, 180, 50);
+        var gradOk = new LinearGradientBrush(
+            btnAcceptArea, Color.FromArgb(0x66, 0xFF, 0x66), Color.FromArgb(0x00, 0xCC, 0x00), 90f);
+        g.FillPath(gradOk, RoundedRectangle(btnAcceptArea, 10));
+        g.DrawString(resourceManager.GetString("signature_btn_Accept"), new Font("Arial", 14, FontStyle.Bold), Brushes.White,
+            CenterText(btnAcceptArea, resourceManager.GetString("signature_btn_Accept"), g, new Font("Arial", 14, FontStyle.Bold)));
+    }
+
+    string tempPath = Path.Combine(Path.GetTempPath(), "firma_ui.png");
+
+    _logger.LogDebug("{Method}: Saving UI image to temporary path: {Path}", method, tempPath);
+    ui.Save(tempPath, System.Drawing.Imaging.ImageFormat.Png);
+
+    var helper = new ProtocolHelper();
+    object imagePathVariant = tempPath;
+
+    var imageData = ConvertBitmapToBGR24(ui);
+
+    _tablet.setInkingMode(0);
+    _tablet.setClearScreen();
+    helper.writeImage(_tablet.Protocol, (byte)0x04, imageData);
+
+    _logger.LogInformation("{Method}: UI image sent to tablet device", method);
+
+    if (File.Exists(tempPath))
+    {
+        File.Delete(tempPath);
+        _logger.LogDebug("{Method}: Temporary image file deleted: {Path}", method, tempPath);
+    }
+
+    _logger.LogDebug("Completed {Method} process successfully", method);
+}
+
+_logger.LogDebug("Starting {Method} process", nameof(DrawScreen));
+...
+_logger.LogDebug("{Method}: Drawing screen with transfer information: {Info}", nameof(DrawScreen), JsonSerializer.Serialize(transferInformation));
+...
+_logger.LogDebug("{Method}: Saving UI image to temporary path: {Path}", nameof(DrawScreen), tempPath);
+...
+_logger.LogInformation("{Method}: UI image sent to tablet device", nameof(DrawScreen));
+...
+_logger.LogDebug("{Method}: Temporary image file deleted: {Path}", nameof(DrawScreen), tempPath);
+...
+_logger.LogDebug("Completed {Method} process successfully", nameof(DrawScreen));
+
+
+
+//////
+
+
+public Response<SignatureResponseDTO> CaptureSignature()
+{
+    const string method = nameof(CaptureSignature);
+    _logger.LogInformation("Starting {Method} process", method);
+
+    var validations = DeviceValidations();
+
+    if (!string.IsNullOrEmpty(validations))
+    {
+        _logger.LogWarning("Validation failed in {Method}: {ValidationMessage}", method, validations);
+        return new Response<SignatureResponseDTO>(new Exception(validations));
+    }
+
+    var capability = _tablet.getCapability();
+    int screenWidth = capability.screenWidth;
+    int screenHeight = capability.screenHeight;
+
+    _logger.LogDebug("Tablet screen resolution: {Width}x{Height}", screenWidth, screenHeight);
+
+    DrawScreen(screenWidth, screenHeight);
+    EventsScreen();
+
+    if (signatureCanceled)
+    {
+        _logger.LogInformation("{Method} process was canceled by the user", method);
+        return new Response<SignatureResponseDTO>(null, resourceManager.GetString("signature_msg_SignatureCanceled"));
+    }
+
+    _logger.LogInformation("{Method} process completed successfully", method);
+    return ConvertImageToBase64(screenWidth, screenHeight);
+}
+
+public Response<SignatureResponseDTO> CaptureSignatureWithTransferInformation(TransferInformationRequestDTO transferInformation)
+{
+    const string method = nameof(CaptureSignatureWithTransferInformation);
+    _logger.LogInformation("Starting {Method} process", method);
+
+    var validations = DeviceValidations();
+
+    if (!string.IsNullOrEmpty(validations))
+    {
+        _logger.LogWarning("Validation failed in {Method}: {ValidationMessage}", method, validations);
+        return new Response<SignatureResponseDTO>(new Exception(validations));
+    }
+
+    var capability = _tablet.getCapability();
+    int screenWidth = capability.screenWidth;
+    int screenHeight = capability.screenHeight;
+
+    _logger.LogDebug("Tablet screen resolution: {Width}x{Height}", screenWidth, screenHeight);
+
+    DrawScreen(screenWidth, screenHeight, transferInformation);
+    EventsScreen(transferInformation);
+
+    if (signatureCanceled)
+    {
+        _logger.LogInformation("{Method} process was canceled by the user", method);
+        return new Response<SignatureResponseDTO>(null, resourceManager.GetString("signature_msg_SignatureCanceled"));
+    }
+
+    _logger.LogInformation("{Method} process completed successfully", method);
+    return ConvertImageToBase64(screenWidth, screenHeight);
+}
+
+//
+public IResult CaptureSignature()
+{
+    try
+    {
+        var base64Signature = _wacomService.CaptureSignature();
+        return Results.Ok(base64Signature);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "An error occurred in {Method}: CaptureSignature", nameof(SignatureController));
+        return Results.BadRequest(new Response<SignatureResponseDTO>(
+            new Exception(resourceManager.GetString("global_msg_InternalError"))
+        ));
+    }
+}
